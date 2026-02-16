@@ -35,8 +35,8 @@ static const uint16_t LONG_PRESS_MS = 800;
 static const float BATTERY_CAPACITY_MAH = 350.0f;
 static const uint32_t DEFAULT_FULL_RUNTIME_SECONDS = 24UL * 60UL * 60UL;
 
-static const uint32_t SCREEN_TIMEOUT_MS = 10UL * 1000UL;
-static const uint32_t DIM_TIMEOUT_MS = 5UL * 1000UL;
+static const uint32_t SCREEN_TIMEOUT_MS = 30UL * 1000UL;  // Sleep after 30 seconds
+static const uint32_t DIM_TIMEOUT_MS = 15UL * 1000UL;     // Dim after 15 seconds
 static const uint8_t DAY_ACTIVE_BRIGHTNESS = 180;
 static const uint8_t DAY_DIM_BRIGHTNESS = 50;
 static const uint8_t NIGHT_ACTIVE_BRIGHTNESS = 80;
@@ -233,9 +233,9 @@ static void syncRtcToBuildTimeOnce()
 // ============================================================================
 
 enum PowerProfile {
-    PROFILE_PERFORMANCE,   // 240 MHz - network, animations
-    PROFILE_BALANCED,      // 80 MHz - normal UI
-    PROFILE_POWER_SAVE,    // 40 MHz - static watch face
+    PROFILE_PERFORMANCE,   // 160 MHz - network operations
+    PROFILE_BALANCED,      // 20 MHz - normal UI (proven by BatmanDial)
+    PROFILE_POWER_SAVE,    // 20 MHz - static watch face
     PROFILE_ULTRA_SAVE     // 20 MHz - sleep/minimal updates
 };
 
@@ -280,11 +280,11 @@ public:
     }
     
     void transitionTo(PowerProfile profile) {
-        uint8_t freq = 80;
+        uint8_t freq = 20;
         switch(profile) {
-            case PROFILE_PERFORMANCE: freq = 240; break;
-            case PROFILE_BALANCED:    freq = 80;  break;
-            case PROFILE_POWER_SAVE:  freq = 40;  break;
+            case PROFILE_PERFORMANCE: freq = 160; break;
+            case PROFILE_BALANCED:    freq = 20;  break;
+            case PROFILE_POWER_SAVE:  freq = 20;  break;
             case PROFILE_ULTRA_SAVE:  freq = 20;  break;
         }
         setCpuFrequencyMhz(freq);
@@ -688,8 +688,6 @@ static void enterLightSleepIfNeeded()
     
     watch->displayWakeup();
     watch->startLvglTick();
-    watch->openBL();
-    watch->setBrightness(calculateContextualBrightness(false));
     rtc->syncToSystem();
     lastRtcSyncMs = millis();
 
@@ -697,7 +695,32 @@ static void enterLightSleepIfNeeded()
     peripheralManager.optimizeForState(STATE_ACTIVE);
 
     displaySleeping = false;
-    lastActivityMs = millis();
+    
+    // DO NOT reset lastActivityMs here - keep the original timer
+    // This prevents false activations from spurious wake events
+    // Only touch events should reset the activity timer
+    
+    // Check if we should immediately return to dim/sleep state
+    uint32_t inactiveMs = millis() - lastActivityMs;
+    
+    if (inactiveMs >= SCREEN_TIMEOUT_MS) {
+        // Too much time has passed - go back to sleep immediately
+        // This was a spurious wake event, not user interaction
+        return;  // Stay in sleep state
+    }
+    
+    // If we're here, wake was recent enough to show display
+    watch->openBL();
+    
+    if (inactiveMs >= DIM_TIMEOUT_MS) {
+        // Show dimmed display
+        watch->setBrightness(calculateContextualBrightness(true));
+        backlightDimmed = true;
+    } else {
+        // Show full brightness
+        watch->setBrightness(calculateContextualBrightness(false));
+        backlightDimmed = false;
+    }
     
     // Tier 3: Force sleep manager back to active
     sleepManager.forceActive();
@@ -1012,8 +1035,8 @@ void setup()
     watch->begin();
     watch->openBL();
 
-    // Tier 1: lower default CPU frequency
-    setCpuFrequencyMhz(80);
+    // Tier 1: minimum CPU frequency for time accuracy (20 MHz proven by BatmanDial)
+    setCpuFrequencyMhz(20);
 
     // Tier 1: disable WiFi by default
     WiFi.mode(WIFI_OFF);
