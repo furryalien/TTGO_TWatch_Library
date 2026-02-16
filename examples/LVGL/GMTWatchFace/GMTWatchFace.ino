@@ -580,6 +580,23 @@ static void periodicRtcSync()
     lastRtcSyncMs = millis();
 }
 
+static bool shouldEnableMotionWake()
+{
+    // Check watch orientation to determine if motion wake should be enabled
+    // Only enable motion wake if watch is in a vertical/wrist position
+    // Disable if laying flat on desk to prevent false wakes from vibrations
+    
+    uint8_t dir = watch->bma->direction();
+    
+    // Laying flat - display facing up or down
+    if (dir == DIRECTION_DISP_UP || dir == DIRECTION_DISP_DOWN) {
+        return false;  // Disable motion wake when flat on desk
+    }
+    
+    // Vertical or tilted position - likely on wrist or being worn
+    return true;
+}
+
 static void smartWiFiSyncChargingOnly()
 {
 #ifdef LILYGO_WATCH_HAS_AXP202
@@ -653,8 +670,16 @@ static void enterLightSleepIfNeeded()
     frequencyScaler.transitionTo(PROFILE_ULTRA_SAVE);
 
     displaySleeping = true;
+    
+    // Always enable power button wake
     gpio_wakeup_enable((gpio_num_t)AXP202_INT, GPIO_INTR_LOW_LEVEL);
-    gpio_wakeup_enable((gpio_num_t)BMA423_INT1, GPIO_INTR_HIGH_LEVEL);
+    
+    // Tier 3: Conditional motion wake - only enable if not laying flat
+    // This prevents false wakes from desk vibrations when watch is stationary
+    if (shouldEnableMotionWake()) {
+        gpio_wakeup_enable((gpio_num_t)BMA423_INT1, GPIO_INTR_HIGH_LEVEL);
+    }
+    
     esp_sleep_enable_gpio_wakeup();
     esp_light_sleep_start();
 
