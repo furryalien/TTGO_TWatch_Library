@@ -694,11 +694,15 @@ static void enterLightSleepIfNeeded()
     // Tier 3: Re-enable peripherals for active state
     peripheralManager.optimizeForState(STATE_ACTIVE);
 
-    displaySleeping = false;
-    
-    // DO NOT reset lastActivityMs here - keep the original timer
-    // This prevents false activations from spurious wake events
-    // Only touch events should reset the activity timer
+    // Check if wake was from user button press (not spurious motion)
+    // If button was pressed, treat as user interaction
+    if (digitalRead(AXP202_INT) == LOW) {
+        // Button is pressed - this is intentional wake
+        lastActivityMs = millis();
+        // Clear the power management IRQ
+        watch->power->readIRQ();
+        watch->power->clearIRQ();
+    }
     
     // Check if we should immediately return to dim/sleep state
     uint32_t inactiveMs = millis() - lastActivityMs;
@@ -706,10 +710,12 @@ static void enterLightSleepIfNeeded()
     if (inactiveMs >= SCREEN_TIMEOUT_MS) {
         // Too much time has passed - go back to sleep immediately
         // This was a spurious wake event, not user interaction
-        return;  // Stay in sleep state
+        // Keep displaySleeping=true and re-enter sleep loop via main loop
+        return;
     }
     
     // If we're here, wake was recent enough to show display
+    displaySleeping = false;
     watch->openBL();
     
     if (inactiveMs >= DIM_TIMEOUT_MS) {
