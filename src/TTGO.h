@@ -131,6 +131,8 @@ typedef FocalTech_Class CapacitiveTouch ;
 #include "libraries/Adafruit_DRV2605_Library/Adafruit_DRV2605.h"
 #endif
 
+#include "board/twatch_power_policy.h"
+
 
 #if !defined(EXTERNAL_TFT_ESPI_LIBRARY) && !defined(LILYGO_BLOCK_ILI9488_MODULE) && !defined(TWATCH_USE_PSRAM_ALLOC_LVGL)
 // #define ENABLE_LVGL_FLUSH_DMA       //Use DMA for transmission by default
@@ -509,20 +511,30 @@ public:
 
     void enableAudio(void)
     {
-#if     defined(LILYGO_WATCH_2020_V2)
-        power->setPowerOutPut(AXP202_LDO3, AXP202_ON);
-#elif   defined(LILYGO_WATCH_2020_V3)
-        power->setPowerOutPut(AXP202_LDO4, AXP202_ON);
-#endif
+        switch (twatch::power::audioPowerRail(twatch::power::currentBoard())) {
+        case twatch::power::Rail::LDO3:
+            power->setPowerOutPut(AXP202_LDO3, AXP202_ON);
+            break;
+        case twatch::power::Rail::LDO4:
+            power->setPowerOutPut(AXP202_LDO4, AXP202_ON);
+            break;
+        default:
+            break;
+        }
     }
 
     void disableAudio(void)
     {
-#if     defined(LILYGO_WATCH_2020_V2)
-        power->setPowerOutPut(AXP202_LDO3, AXP202_OFF);
-#elif   defined(LILYGO_WATCH_2020_V3)
-        power->setPowerOutPut(AXP202_LDO4, AXP202_OFF);
-#endif
+        switch (twatch::power::audioPowerRail(twatch::power::currentBoard())) {
+        case twatch::power::Rail::LDO3:
+            power->setPowerOutPut(AXP202_LDO3, AXP202_OFF);
+            break;
+        case twatch::power::Rail::LDO4:
+            power->setPowerOutPut(AXP202_LDO4, AXP202_OFF);
+            break;
+        default:
+            break;
+        }
     }
 
 #ifdef LILYGO_WATCH_DRV2605
@@ -546,26 +558,24 @@ public:
 
     void trunOnGPS()
     {
-#ifdef LILYGO_WATCH_2020_V2
-        // 2020 v2 use axp202 ldo 4
-        if (power)
-            power->setPowerOutPut(AXP202_LDO4, true);
-#else
-        if (power)
-            power->setPowerOutPut(AXP202_LDO3, true);
-#endif
+        if (power) {
+            if (twatch::power::gpsPowerRail(twatch::power::currentBoard()) == twatch::power::Rail::LDO4) {
+                power->setPowerOutPut(AXP202_LDO4, true);
+            } else {
+                power->setPowerOutPut(AXP202_LDO3, true);
+            }
+        }
     }
 
     void turnOffGPS()
     {
-#ifdef LILYGO_WATCH_2020_V2
-        // 2020 v2 use axp202 ldo 4
-        if (power)
-            power->setPowerOutPut(AXP202_LDO4, false);
-#else
-        if (power)
-            power->setPowerOutPut(AXP202_LDO3, false);
-#endif
+        if (power) {
+            if (twatch::power::gpsPowerRail(twatch::power::currentBoard()) == twatch::power::Rail::LDO4) {
+                power->setPowerOutPut(AXP202_LDO4, false);
+            } else {
+                power->setPowerOutPut(AXP202_LDO3, false);
+            }
+        }
     }
 
 
@@ -707,17 +717,21 @@ public:
 #ifdef LILYGO_WATCH_HAS_BACKLIGHT
     void openBL()
     {
-#if  !defined(LILYGO_WATCH_2020_V1) && defined(LILYGO_WATCH_HAS_AXP202)
-        power->setPowerOutPut(AXP202_LDO2, AXP202_ON);
-#endif  /*LILYGO_WATCH_2020_V1*/
+#ifdef LILYGO_WATCH_HAS_AXP202
+        if (twatch::power::toggleBacklightRailViaPowerIC(twatch::power::currentBoard())) {
+            power->setPowerOutPut(AXP202_LDO2, AXP202_ON);
+        }
+#endif
         bl->on();
     }
 
     void closeBL()
     {
-#if  !defined(LILYGO_WATCH_2020_V1) && defined(LILYGO_WATCH_HAS_AXP202)
-        power->setPowerOutPut(AXP202_LDO2, AXP202_OFF);
-#endif  /*LILYGO_WATCH_2020_V1*/
+#ifdef LILYGO_WATCH_HAS_AXP202
+        if (twatch::power::toggleBacklightRailViaPowerIC(twatch::power::currentBoard())) {
+            power->setPowerOutPut(AXP202_LDO2, AXP202_OFF);
+        }
+#endif
         bl->off();
     }
 
@@ -1444,11 +1458,11 @@ private:
 
             power->setLDO2Voltage(3300);
 
-#ifdef  LILYGO_WATCH_2020_V1
-            //In the 2020V1 version, the ST7789 chip power supply
-            //is shared with the backlight, so LDO2 cannot be turned off
-            power->setPowerOutPut(AXP202_LDO2, AXP202_ON);
-#endif  /*LILYGO_WATCH_2020_V1*/
+            if (twatch::power::keepDisplayRailEnabledDuringInit(twatch::power::currentBoard())) {
+                //In the 2020V1 version, the ST7789 chip power supply
+                //is shared with the backlight, so LDO2 cannot be turned off
+                power->setPowerOutPut(AXP202_LDO2, AXP202_ON);
+            }
 
 
 #ifdef  LILYGO_WATCH_2020_V2

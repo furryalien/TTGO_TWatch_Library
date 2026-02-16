@@ -93,6 +93,7 @@
 - [TWATCH 2020 V1 Pin mapping and other instructions](docs/watch_2020_v1.md)
 - [TWATCH 2020 V2 Pin mapping and other instructions](docs/watch_2020_v2.md)
 - [TWATCH 2020 V3 Pin mapping and other instructions](docs/watch_2020_v3.md)
+- [2020-V1 test coverage status, pause/handoff, and next steps](docs/test_coverage_analysis_2020v1.md)
 
 
 

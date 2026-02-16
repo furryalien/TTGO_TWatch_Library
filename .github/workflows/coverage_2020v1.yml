@@ -1,0 +1,77 @@
+name: 2020v1 Coverage Roadmap
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+
+jobs:
+  sprint1-unit-policy:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov platformio
+
+      - name: Run Sprint 1 unit tests
+        shell: pwsh
+        run: ./scripts/run_sprint1_unit_tests.ps1
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprint1-python-coverage
+          path: coverage.xml
+
+  sprint2-integration-builds:
+    runs-on: windows-latest
+    needs: sprint1-unit-policy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Run Sprint 2 integration compile checks
+        shell: pwsh
+        run: ./scripts/run_sprint2_integration_builds.ps1
+
+  sprint3-cpp-coverage:
+    runs-on: ubuntu-latest
+    needs: sprint2-integration-builds
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install C++ coverage tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ gcovr
+
+      - name: Run Sprint 3 C++ coverage checks
+        run: |
+          chmod +x ./scripts/run_sprint3_cpp_coverage.sh
+          ./scripts/run_sprint3_cpp_coverage.sh
+
+      - name: Upload C++ coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprint3-cpp-coverage
+          path: coverage/cpp/coverage_cpp.xml
