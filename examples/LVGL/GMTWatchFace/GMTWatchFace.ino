@@ -2,6 +2,9 @@
 #include <math.h>
 #include <Preferences.h>
 #include <string.h>
+#include <WiFi.h>
+#include <time.h>
+#include "esp_sleep.h"
 
 TTGOClass *watch = nullptr;
 PCF8563_Class *rtc = nullptr;
@@ -32,6 +35,23 @@ static const uint16_t LONG_PRESS_MS = 800;
 static const float BATTERY_CAPACITY_MAH = 350.0f;
 static const uint32_t DEFAULT_FULL_RUNTIME_SECONDS = 24UL * 60UL * 60UL;
 
+static const uint32_t SCREEN_TIMEOUT_MS = 10UL * 1000UL;
+static const uint32_t DIM_TIMEOUT_MS = 5UL * 1000UL;
+static const uint8_t DAY_ACTIVE_BRIGHTNESS = 180;
+static const uint8_t DAY_DIM_BRIGHTNESS = 50;
+static const uint8_t NIGHT_ACTIVE_BRIGHTNESS = 80;
+static const uint8_t NIGHT_DIM_BRIGHTNESS = 20;
+static const uint32_t RTC_SYNC_INTERVAL_MS = 60UL * 60UL * 1000UL;
+static const uint32_t WIFI_SYNC_INTERVAL_MS = 4UL * 60UL * 60UL * 1000UL;
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 8000UL;
+static const char *RTC_TIME_ZONE = "CST-8";
+
+static bool displaySleeping = false;
+static bool backlightDimmed = false;
+static uint32_t lastActivityMs = 0;
+static uint32_t lastRtcSyncMs = 0;
+static uint32_t lastWiFiSyncMs = 0;
+
 static int clampPercent(int value)
 {
     if (value < 0) {
@@ -41,6 +61,32 @@ static int clampPercent(int value)
         return 100;
     }
     return value;
+}
+
+static uint8_t calculateContextualBrightness(bool dimmed)
+{
+    if (!rtc) {
+        return dimmed ? DAY_DIM_BRIGHTNESS : DAY_ACTIVE_BRIGHTNESS;
+    }
+
+    RTC_Date now = rtc->getDateTime();
+    bool isNightTime = (now.hour >= 22 || now.hour < 6);
+
+#ifdef LILYGO_WATCH_HAS_AXP202
+    if (watch && watch->power) {
+        float batteryVoltage = watch->power->getBattVoltage();
+        if (batteryVoltage < 3.5f) {
+            uint8_t baseBrightness = isNightTime ? 
+                (dimmed ? NIGHT_DIM_BRIGHTNESS : NIGHT_ACTIVE_BRIGHTNESS) : 
+                (dimmed ? DAY_DIM_BRIGHTNESS : DAY_ACTIVE_BRIGHTNESS);
+            return (uint8_t)(baseBrightness * 0.7f);
+        }
+    }
+#endif
+
+    return isNightTime ? 
+        (dimmed ? NIGHT_DIM_BRIGHTNESS : NIGHT_ACTIVE_BRIGHTNESS) : 
+        (dimmed ? DAY_DIM_BRIGHTNESS : DAY_ACTIVE_BRIGHTNESS);
 }
 
 static uint32_t estimateBatterySecondsRemaining(int pct, bool charging, float chargeCurrentMa, float dischargeCurrentMa)
@@ -182,6 +228,267 @@ static void syncRtcToBuildTimeOnce()
     }
 }
 
+// ============================================================================
+// TIER 3: ADVANCED POWER MANAGEMENT CLASSES
+// ============================================================================
+
+enum PowerProfile {
+    PROFILE_PERFORMANCE,   // 240 MHz - network, animations
+    PROFILE_BALANCED,      // 80 MHz - normal UI
+    PROFILE_POWER_SAVE,    // 40 MHz - static watch face
+    PROFILE_ULTRA_SAVE     // 20 MHz - sleep/minimal updates
+};
+
+class DynamicFrequencyScaler {
+private:
+    PowerProfile currentProfile;
+    uint32_t lastTransition;
+    bool wifiActive;
+    bool animationActive;
+    
+public:
+    DynamicFrequencyScaler() : currentProfile(PROFILE_BALANCED), lastTransition(0), 
+                               wifiActive(false), animationActive(false) {}
+    
+    void setWiFiActive(bool active) {
+        wifiActive = active;
+        update();
+    }
+    
+    void setAnimationActive(bool active) {
+        animationActive = active;
+        update();
+    }
+    
+    void update() {
+        PowerProfile target = calculateOptimalProfile();
+        if (target != currentProfile) {
+            transitionTo(target);
+        }
+    }
+    
+    PowerProfile calculateOptimalProfile() {
+        if (wifiActive || animationActive) {
+            return PROFILE_PERFORMANCE;
+        } else if (displaySleeping) {
+            return PROFILE_ULTRA_SAVE;
+        } else if (settingsOpen || (millis() - lastActivityMs) < 3000) {
+            return PROFILE_BALANCED;
+        } else {
+            return PROFILE_POWER_SAVE;
+        }
+    }
+    
+    void transitionTo(PowerProfile profile) {
+        uint8_t freq = 80;
+        switch(profile) {
+            case PROFILE_PERFORMANCE: freq = 240; break;
+            case PROFILE_BALANCED:    freq = 80;  break;
+            case PROFILE_POWER_SAVE:  freq = 40;  break;
+            case PROFILE_ULTRA_SAVE:  freq = 20;  break;
+        }
+        setCpuFrequencyMhz(freq);
+        currentProfile = profile;
+        lastTransition = millis();
+    }
+    
+    PowerProfile getCurrentProfile() const {
+        return currentProfile;
+    }
+};
+
+enum SleepState {
+    STATE_ACTIVE,        // Full power, screen on
+    STATE_IDLE,          // Screen on, no interaction
+    STATE_DIM,           // Screen dimmed
+    STATE_LIGHT_SLEEP,   // Screen off, quick wake
+    STATE_DEEP_STANDBY   // Maximum power save (not implemented for active use)
+};
+
+class SleepStateManager {
+private:
+    SleepState currentState;
+    uint32_t stateEnterTime;
+    
+    static const uint32_t IDLE_TRANSITION_MS = 3000;
+    static const uint32_t LIGHT_SLEEP_TIMEOUT_MS = 300000;  // 5 minutes
+    
+public:
+    SleepStateManager() : currentState(STATE_ACTIVE), stateEnterTime(0) {}
+    
+    void update(uint32_t inactiveMs) {
+        SleepState targetState = calculateTargetState(inactiveMs);
+        if (targetState != currentState) {
+            transitionTo(targetState);
+        }
+    }
+    
+    SleepState calculateTargetState(uint32_t inactiveMs) {
+        if (inactiveMs < IDLE_TRANSITION_MS) {
+            return STATE_ACTIVE;
+        } else if (inactiveMs < DIM_TIMEOUT_MS) {
+            return STATE_IDLE;
+        } else if (inactiveMs < SCREEN_TIMEOUT_MS) {
+            return STATE_DIM;
+        } else {
+            return STATE_LIGHT_SLEEP;
+        }
+    }
+    
+    void transitionTo(SleepState newState) {
+        currentState = newState;
+        stateEnterTime = millis();
+    }
+    
+    SleepState getCurrentState() const {
+        return currentState;
+    }
+    
+    void forceActive() {
+        transitionTo(STATE_ACTIVE);
+    }
+};
+
+class AlwaysOnDisplayManager {
+private:
+    bool aodEnabled;
+    bool aodActive;
+    uint32_t lastAodUpdate;
+    static const uint32_t AOD_UPDATE_INTERVAL_MS = 60000;  // Update every minute
+    static const uint8_t AOD_BRIGHTNESS = 15;  // 5% brightness
+    
+public:
+    AlwaysOnDisplayManager() : aodEnabled(false), aodActive(false), lastAodUpdate(0) {}
+    
+    void setEnabled(bool enabled) {
+        aodEnabled = enabled;
+    }
+    
+    bool isEnabled() const {
+        return aodEnabled;
+    }
+    
+    bool isActive() const {
+        return aodActive;
+    }
+    
+    void activate() {
+        if (!aodEnabled) return;
+        
+        aodActive = true;
+        watch->setBrightness(AOD_BRIGHTNESS);
+        setCpuFrequencyMhz(20);
+        lastAodUpdate = millis();
+    }
+    
+    void deactivate() {
+        aodActive = false;
+        watch->setBrightness(calculateContextualBrightness(false));
+        setCpuFrequencyMhz(80);
+    }
+    
+    bool needsUpdate() {
+        if (!aodActive) return false;
+        return (millis() - lastAodUpdate) >= AOD_UPDATE_INTERVAL_MS;
+    }
+    
+    void markUpdated() {
+        lastAodUpdate = millis();
+    }
+};
+
+class PeripheralPowerManager {
+private:
+    bool accelEnabled;
+    bool stepCountEnabled;
+    bool audioEnabled;
+    uint32_t lastOptimization;
+    
+    static const uint32_t OPTIMIZATION_INTERVAL_MS = 10000;
+    
+public:
+    PeripheralPowerManager() : accelEnabled(true), stepCountEnabled(true), 
+                               audioEnabled(false), lastOptimization(0) {}
+    
+    void optimizeForState(SleepState state) {
+        if (millis() - lastOptimization < OPTIMIZATION_INTERVAL_MS) {
+            return;
+        }
+        
+        switch(state) {
+            case STATE_ACTIVE:
+            case STATE_IDLE:
+            case STATE_DIM:
+                enableAccelIfNeeded(true);
+                enableStepCountIfNeeded(true);
+                break;
+                
+            case STATE_LIGHT_SLEEP:
+                enableAccelIfNeeded(false);
+                enableStepCountIfNeeded(false);
+                break;
+                
+            case STATE_DEEP_STANDBY:
+                disableAllPeripherals();
+                break;
+        }
+        
+        lastOptimization = millis();
+    }
+    
+    void enableAccelIfNeeded(bool enable) {
+        if (accelEnabled != enable) {
+            if (enable) {
+                watch->bma->enableAccel();
+            } else {
+                watch->bma->disableAccel();
+            }
+            accelEnabled = enable;
+        }
+    }
+    
+    void enableStepCountIfNeeded(bool enable) {
+        if (stepCountEnabled != enable) {
+            watch->bma->enableStepCountInterrupt(enable);
+            stepCountEnabled = enable;
+        }
+    }
+    
+    void disableAllPeripherals() {
+        watch->bma->disableAccel();
+        watch->bma->enableStepCountInterrupt(false);
+        watch->bma->enableWakeupInterrupt(false);
+        
+#ifdef LILYGO_WATCH_HAS_AXP202
+        if (watch && watch->power) {
+            watch->power->setPowerOutPut(AXP202_LDO3, AXP202_OFF);
+        }
+#endif
+        
+        accelEnabled = false;
+        stepCountEnabled = false;
+        audioEnabled = false;
+    }
+    
+    float estimatePowerSavings() {
+        float savings = 0.0f;
+        if (!accelEnabled) savings += 0.165f;  // mA
+        if (!stepCountEnabled) savings += 0.05f;
+        if (!audioEnabled) savings += 0.3f;
+        return savings;
+    }
+};
+
+// Global Tier 3 managers
+static DynamicFrequencyScaler frequencyScaler;
+static SleepStateManager sleepManager;
+static AlwaysOnDisplayManager aodManager;
+static PeripheralPowerManager peripheralManager;
+
+// ============================================================================
+// END TIER 3 CLASSES
+// ============================================================================
+
 static bool parseAndSetRtcFromSerial(const char *cmd)
 {
     int year = 0;
@@ -262,6 +569,149 @@ static void handleSerialCommands()
             buffer[idx++] = c;
         }
     }
+}
+
+static void periodicRtcSync()
+{
+    if (millis() - lastRtcSyncMs < RTC_SYNC_INTERVAL_MS) {
+        return;
+    }
+    rtc->syncToSystem();
+    lastRtcSyncMs = millis();
+}
+
+static void smartWiFiSyncChargingOnly()
+{
+#ifdef LILYGO_WATCH_HAS_AXP202
+    if (!watch || !watch->power || !watch->power->isChargeing()) {
+        return;
+    }
+#else
+    return;
+#endif
+
+    if (millis() - lastWiFiSyncMs < WIFI_SYNC_INTERVAL_MS) {
+        return;
+    }
+
+    bool wasConnected = WiFi.isConnected();
+    if (!wasConnected) {
+        // Tier 3: Notify frequency scaler WiFi is activating
+        frequencyScaler.setWiFiActive(true);
+        
+        WiFi.mode(WIFI_STA);
+        WiFi.begin();
+        uint32_t start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+            delay(100);
+        }
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        configTzTime(RTC_TIME_ZONE, "pool.ntp.org");
+        struct tm nowTm;
+        if (getLocalTime(&nowTm, 5000)) {
+            rtc->setDateTime((uint16_t)(nowTm.tm_year + 1900),
+                             (uint8_t)(nowTm.tm_mon + 1),
+                             (uint8_t)nowTm.tm_mday,
+                             (uint8_t)nowTm.tm_hour,
+                             (uint8_t)nowTm.tm_min,
+                             (uint8_t)nowTm.tm_sec);
+            rtc->syncToSystem();
+            lastRtcSyncMs = millis();
+        }
+    }
+
+    if (!wasConnected) {
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        
+        // Tier 3: Notify frequency scaler WiFi is done
+        frequencyScaler.setWiFiActive(false);
+    }
+
+    lastWiFiSyncMs = millis();
+}
+
+static void enterLightSleepIfNeeded()
+{
+    if (displaySleeping) {
+        return;
+    }
+
+    watch->closeBL();
+    watch->displaySleep();
+    watch->stopLvglTick();
+    backlightDimmed = false;
+
+    // Tier 3: Peripheral manager handles sensor optimization
+    peripheralManager.optimizeForState(STATE_LIGHT_SLEEP);
+
+    WiFi.mode(WIFI_OFF);
+    
+    // Tier 3: Dynamic frequency scaling for ultra-save mode
+    frequencyScaler.transitionTo(PROFILE_ULTRA_SAVE);
+
+    displaySleeping = true;
+    gpio_wakeup_enable((gpio_num_t)AXP202_INT, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)BMA423_INT1, GPIO_INTR_HIGH_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+    esp_light_sleep_start();
+
+    // Tier 3: Resume balanced frequency on wake
+    frequencyScaler.transitionTo(PROFILE_BALANCED);
+    
+    watch->displayWakeup();
+    watch->startLvglTick();
+    watch->openBL();
+    watch->setBrightness(calculateContextualBrightness(false));
+    rtc->syncToSystem();
+    lastRtcSyncMs = millis();
+
+    // Tier 3: Re-enable peripherals for active state
+    peripheralManager.optimizeForState(STATE_ACTIVE);
+
+    displaySleeping = false;
+    lastActivityMs = millis();
+    
+    // Tier 3: Force sleep manager back to active
+    sleepManager.forceActive();
+    
+    drawFace(rtc->getDateTime());
+}
+
+static void applyBacklightPolicy()
+{
+    if (displaySleeping) {
+        return;
+    }
+
+    uint32_t inactiveMs = millis() - lastActivityMs;
+    
+    // Tier 3: Update sleep state manager
+    sleepManager.update(inactiveMs);
+    SleepState currentState = sleepManager.getCurrentState();
+    
+    // Tier 3: Optimize peripherals based on state
+    peripheralManager.optimizeForState(currentState);
+    
+    if (inactiveMs < DIM_TIMEOUT_MS) {
+        if (backlightDimmed) {
+            watch->setBrightness(calculateContextualBrightness(false));
+            backlightDimmed = false;
+        }
+        return;
+    }
+
+    if (inactiveMs < SCREEN_TIMEOUT_MS) {
+        if (!backlightDimmed) {
+            watch->setBrightness(calculateContextualBrightness(true));
+            backlightDimmed = true;
+        }
+        return;
+    }
+
+    enterLightSleepIfNeeded();
 }
 
 static void drawStaticDial()
@@ -349,6 +799,10 @@ static void drawWeekdayLabel(const RTC_Date &dt)
 
 static void drawPowerIndicator()
 {
+    static uint32_t lastBatteryUpdateMs = 0;
+    static uint32_t cachedRemainingMinutes = 0;
+    const uint32_t BATTERY_UPDATE_INTERVAL_MS = 5UL * 60UL * 1000UL;
+
     const int16_t bx = 205;
     const int16_t by = 10;
     const int16_t bw = 14;
@@ -382,13 +836,18 @@ static void drawPowerIndicator()
         canvas->drawLine(bx + 8, by + 3, bx + 6, by + 5, TFT_YELLOW);
     }
 
-    uint32_t remainSeconds = estimateBatterySecondsRemaining(pct, charging, chargeCurrentMa, dischargeCurrentMa);
-    char etaBuf[10];
-    formatHms(remainSeconds, etaBuf, sizeof(etaBuf));
+    if (millis() - lastBatteryUpdateMs >= BATTERY_UPDATE_INTERVAL_MS || lastBatteryUpdateMs == 0) {
+        uint32_t remainSeconds = estimateBatterySecondsRemaining(pct, charging, chargeCurrentMa, dischargeCurrentMa);
+        cachedRemainingMinutes = remainSeconds / 60UL;
+        lastBatteryUpdateMs = millis();
+    }
+
+    char minBuf[8];
+    snprintf(minBuf, sizeof(minBuf), "%lum", (unsigned long)cachedRemainingMinutes);
     canvas->setTextColor(TFT_WHITE, TFT_BLACK);
     canvas->setTextDatum(TR_DATUM);
     canvas->setTextFont(1);
-    canvas->drawString(etaBuf, SCREEN_W - 1, by + bh + 4, 1);
+    canvas->drawString(minBuf, SCREEN_W - 1, by + bh + 4, 1);
 }
 
 static void drawSettingsOverlay()
@@ -496,11 +955,13 @@ static void pollTouchUI()
     if (touched && !touchDown) {
         touchDown = true;
         touchDownStart = millis();
+        lastActivityMs = millis();
     }
 
     if (touched) {
         lastTouchX = x;
         lastTouchY = y;
+        lastActivityMs = millis();
     }
 
     if (touchDown && touched && !settingsOpen) {
@@ -526,15 +987,28 @@ void setup()
     watch->begin();
     watch->openBL();
 
+    // Tier 1: lower default CPU frequency
+    setCpuFrequencyMhz(80);
+
+    // Tier 1: disable WiFi by default
+    WiFi.mode(WIFI_OFF);
+
     // Keep LVGL clock active because this is an LVGL-configured example folder.
     watch->lvgl_begin();
 
-    // Lower backlight a little to better match dark-dial style.
-    watch->bl->adjust(160);
+    // Tier 1: lower default brightness with context awareness.
+    watch->setBrightness(calculateContextualBrightness(false));
 
 #ifdef LILYGO_WATCH_HAS_AXP202
     watch->power->adc1Enable(AXP202_BATT_VOL_ADC1 | AXP202_BATT_CUR_ADC1 | AXP202_VBUS_VOL_ADC1 | AXP202_VBUS_CUR_ADC1, AXP202_ON);
+    // Tier 1: disable audio rail when not used
+    watch->power->setPowerOutPut(AXP202_LDO3, AXP202_OFF);
 #endif
+
+    // Tier 2: sensor policy defaults while screen is active
+    watch->bma->enableWakeupInterrupt(false);
+    watch->bma->enableAccel();
+    watch->bma->enableStepCountInterrupt(true);
 
     rtc = watch->rtc;
     tft = watch->tft;
@@ -549,7 +1023,18 @@ void setup()
     canvas->createSprite(SCREEN_W, SCREEN_H);
     canvas->fillSprite(TFT_BLACK);
 
+    // Tier 3: Initialize power managers
+    frequencyScaler.transitionTo(PROFILE_BALANCED);
+    sleepManager.forceActive();
+    peripheralManager.optimizeForState(STATE_ACTIVE);
+    aodManager.setEnabled(false);  // AOD disabled by default
+    Serial.println("Tier 3 power managers initialized");
+
     drawFace(rtc->getDateTime());
+
+    lastActivityMs = millis();
+    lastRtcSyncMs = millis();
+    lastWiFiSyncMs = 0;
 }
 
 void loop()
@@ -559,6 +1044,14 @@ void loop()
 
     handleSerialCommands();
     pollTouchUI();
+
+    // Tier 2 policies
+    applyBacklightPolicy();
+    periodicRtcSync();
+    smartWiFiSyncChargingOnly();
+    
+    // Tier 3: Update dynamic frequency scaling
+    frequencyScaler.update();
 
     RTC_Date now = rtc->getDateTime();
 

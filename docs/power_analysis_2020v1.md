@@ -1204,6 +1204,47 @@ This preserves excellent user experience while maintaining time accuracy.
 
 ## Implementation Recommendations
 
+### Battery Life Estimation Baseline (Applied to this section)
+
+To ground all recommendations in a practical target, this section assumes:
+
+- **Observed current battery life:** **~3.0 hours**
+- **Estimate formula:** `Estimated life = 3.0h × (1 + improvement%)`
+- **Interpretation:** values are directional ranges; real-world gains vary by brightness, wake frequency, and WiFi/BLE duty cycle
+
+### Expected Battery Life by Individual Improvement (3-hour baseline)
+
+| Improvement | Estimated Improvement vs Baseline | Expected Battery Life |
+|-------------|-----------------------------------|-----------------------|
+| Reduce screen timeout | +10% to +20% | **3.3h to 3.6h** |
+| Lower default brightness (60-70%) | +15% to +25% | **3.45h to 3.75h** |
+| Disable WiFi by default (enable only when needed) | +20% to +60%* | **3.6h to 4.8h** |
+| Turn off audio LDO when unused | +1% to +3% | **3.03h to 3.09h** |
+| Set CPU frequency to 80 MHz | +20% to +35% | **3.6h to 4.05h** |
+| Multi-stage backlight dimming | +15% to +30% | **3.45h to 3.9h** |
+| Conditional sensor activation | +1% to +3% | **3.03h to 3.09h** |
+| Periodic RTC sync (hourly) | +0% to +1% | **3.0h to 3.03h** |
+| Smart WiFi sync (charging or batched windows) | +10% to +40%* | **3.3h to 4.2h** |
+| Dynamic frequency scaling | +25% to +45% | **3.75h to 4.35h** |
+| Hybrid sleep manager | +40% to +90% | **4.2h to 5.7h** |
+| Always-on display mode (ultra-dim/minimal refresh) | +35% to +80% | **4.05h to 5.4h** |
+| Intelligent peripheral manager | +8% to +15% | **3.24h to 3.45h** |
+
+\* Highly usage-dependent; impact is greatest when WiFi would otherwise remain enabled for long intervals.
+
+### Expected Battery Life by Improvement Collections
+
+These collections correspond to the phased implementation path below.
+
+| Improvement Collection | Aggregate Improvement vs 3h Baseline | Expected Battery Life |
+|------------------------|---------------------------------------|-----------------------|
+| **Collection A (Phase 1 quick wins)** | +30% to +40% | **3.9h to 4.2h** |
+| **Collection B (Phase 1 + Phase 2)** | +50% to +60% | **4.5h to 4.8h** |
+| **Collection C (Phase 1 + 2 + 3)** | +70% to +80% | **5.1h to 5.4h** |
+| **Collection D (All phases, incl. advanced controls)** | +85% to +95% | **5.55h to 5.85h** |
+
+> Note: Collection totals are **not** a direct sum of all individual rows. Overlap and interaction effects are already accounted for in the aggregate ranges.
+
 ### Tier 1: Quick Wins (Easy Implementation, High Impact)
 
 **1. Reduce Screen Timeout**
@@ -1385,6 +1426,7 @@ class PeripheralManager {
 - Disable audio LDO
 
 **Expected Result:** ~30-40% battery life improvement
+**Expected Battery Life from 3h baseline:** **~3.9h to 4.2h**
 
 **Phase 2: Short Term (Week 1)**
 - Implement multi-stage backlight dimming
@@ -1393,6 +1435,7 @@ class PeripheralManager {
 - Add smart WiFi sync (charging only)
 
 **Expected Result:** ~50-60% battery life improvement
+**Expected Battery Life from 3h baseline:** **~4.5h to 4.8h**
 
 **Phase 3: Medium Term (Month 1)**
 - Implement dynamic frequency scaling
@@ -1401,6 +1444,7 @@ class PeripheralManager {
 - Add battery-based power profiles
 
 **Expected Result:** ~70-80% battery life improvement
+**Expected Battery Life from 3h baseline:** **~5.1h to 5.4h**
 
 **Phase 4: Long Term (Optional)**
 - Implement hybrid sleep manager
@@ -1409,6 +1453,7 @@ class PeripheralManager {
 - Implement user-configurable power profiles
 
 **Expected Result:** ~85-95% battery life improvement (relative to baseline)
+**Expected Battery Life from 3h baseline:** **~5.55h to 5.85h**
 
 ---
 

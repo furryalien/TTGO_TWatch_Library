@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
-$repo = "C:/Users/dgran/code/TTGO_TWatch_Library"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repo = Resolve-Path (Join-Path $scriptDir "..")
 $testSource = "tests/cpp/twatch_power_policy_test.cpp"
 $outputDir = "coverage/cpp"
 $buildDir = "$outputDir/build"
