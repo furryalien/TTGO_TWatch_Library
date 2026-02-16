@@ -1,6 +1,7 @@
 #include "config.h"
 #include <math.h>
 #include <Preferences.h>
+#include <string.h>
 
 TTGOClass *watch = nullptr;
 PCF8563_Class *rtc = nullptr;
@@ -28,6 +29,8 @@ static int16_t lastTouchX = 0;
 static int16_t lastTouchY = 0;
 
 static const uint16_t LONG_PRESS_MS = 800;
+static const float BATTERY_CAPACITY_MAH = 350.0f;
+static const uint32_t DEFAULT_FULL_RUNTIME_SECONDS = 24UL * 60UL * 60UL;
 
 static int clampPercent(int value)
 {
@@ -38,6 +41,40 @@ static int clampPercent(int value)
         return 100;
     }
     return value;
+}
+
+static uint32_t estimateBatterySecondsRemaining(int pct, bool charging, float chargeCurrentMa, float dischargeCurrentMa)
+{
+    float ratio = (float)clampPercent(pct) / 100.0f;
+    float seconds = ratio * (float)DEFAULT_FULL_RUNTIME_SECONDS;
+
+    if (charging) {
+        if (chargeCurrentMa > 1.0f) {
+            seconds = ((100.0f - (float)pct) / 100.0f) * BATTERY_CAPACITY_MAH / chargeCurrentMa * 3600.0f;
+        } else {
+            seconds = (1.0f - ratio) * (float)DEFAULT_FULL_RUNTIME_SECONDS;
+        }
+    } else {
+        if (dischargeCurrentMa > 1.0f) {
+            seconds = ratio * BATTERY_CAPACITY_MAH / dischargeCurrentMa * 3600.0f;
+        }
+    }
+
+    if (seconds < 0.0f) {
+        seconds = 0.0f;
+    }
+    if (seconds > 359999.0f) {
+        seconds = 359999.0f;
+    }
+    return (uint32_t)seconds;
+}
+
+static void formatHms(uint32_t totalSeconds, char *out, size_t outLen)
+{
+    uint32_t hours = totalSeconds / 3600UL;
+    uint32_t minutes = (totalSeconds % 3600UL) / 60UL;
+    uint32_t seconds = totalSeconds % 60UL;
+    snprintf(out, outLen, "%02lu:%02lu:%02lu", (unsigned long)hours, (unsigned long)minutes, (unsigned long)seconds);
 }
 
 static float normalizeAngle(float angle)
@@ -131,6 +168,102 @@ static void loadSettings()
     gmtOffsetHours = clampOffset((int8_t)prefs.getChar("gmtOff", 0));
 }
 
+static void syncRtcToBuildTimeOnce()
+{
+    if (!rtc) {
+        return;
+    }
+
+    const char *buildStamp = __DATE__ " " __TIME__;
+    String syncedBuild = prefs.getString("rtcBuild", "");
+    if (syncedBuild != String(buildStamp)) {
+        rtc->setDateTime(RTC_Date(__DATE__, __TIME__));
+        prefs.putString("rtcBuild", buildStamp);
+    }
+}
+
+static bool parseAndSetRtcFromSerial(const char *cmd)
+{
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+
+    bool matched =
+        (sscanf(cmd, "SET %d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) == 6) ||
+        (sscanf(cmd, "SET %d %d %d %d %d %d", &year, &month, &day, &hour, &minute, &second) == 6);
+
+    if (!matched) {
+        return false;
+    }
+
+    bool valid =
+        year >= 2000 && year <= 2099 &&
+        month >= 1 && month <= 12 &&
+        day >= 1 && day <= 31 &&
+        hour >= 0 && hour <= 23 &&
+        minute >= 0 && minute <= 59 &&
+        second >= 0 && second <= 59;
+
+    if (!valid) {
+        Serial.println("ERR Invalid date/time range. Use YYYY-MM-DD HH:MM:SS");
+        return true;
+    }
+
+    rtc->setDateTime((uint16_t)year, (uint8_t)month, (uint8_t)day, (uint8_t)hour, (uint8_t)minute, (uint8_t)second);
+    RTC_Date now = rtc->getDateTime();
+    Serial.printf("OK RTC set to %04u-%02u-%02u %02u:%02u:%02u\n", now.year, now.month, now.day, now.hour, now.minute, now.second);
+    return true;
+}
+
+static void handleSerialCommands()
+{
+    static char buffer[80];
+    static uint8_t idx = 0;
+
+    while (Serial.available() > 0) {
+        char c = (char)Serial.read();
+
+        if (c == '\r') {
+            continue;
+        }
+
+        if (c == '\n') {
+            buffer[idx] = '\0';
+            idx = 0;
+
+            if (buffer[0] == '\0') {
+                continue;
+            }
+
+            if (strcmp(buffer, "HELP") == 0) {
+                Serial.println("Commands:");
+                Serial.println("  SET YYYY-MM-DD HH:MM:SS");
+                Serial.println("  SET YYYY MM DD HH MM SS");
+                Serial.println("  GET");
+                continue;
+            }
+
+            if (strcmp(buffer, "GET") == 0) {
+                RTC_Date now = rtc->getDateTime();
+                Serial.printf("RTC %04u-%02u-%02u %02u:%02u:%02u\n", now.year, now.month, now.day, now.hour, now.minute, now.second);
+                continue;
+            }
+
+            if (!parseAndSetRtcFromSerial(buffer)) {
+                Serial.println("ERR Unknown command. Type HELP");
+            }
+            continue;
+        }
+
+        if (idx < sizeof(buffer) - 1) {
+            buffer[idx++] = c;
+        }
+    }
+}
+
 static void drawStaticDial()
 {
     canvas->fillSprite(TFT_BLACK);
@@ -180,11 +313,11 @@ static void drawStaticDial()
 
     // 12, 9, 6, 3 numerals
     canvas->setTextColor(TFT_WHITE, TFT_BLACK);
-    canvas->setTextFont(6);
-    canvas->drawCentreString("12", CX, CY - 58, 6);
-    canvas->drawCentreString("9", CX - 66, CY - 5, 6);
-    canvas->drawCentreString("6", CX, CY + 54, 6);
-    canvas->drawCentreString("3", CX + 66, CY - 5, 6);
+    canvas->setTextFont(4);
+    canvas->drawCentreString("12", CX, CY - 58, 4);
+    canvas->drawCentreString("9", CX - 66, CY - 9, 4);
+    canvas->drawCentreString("6", CX, CY + 58, 4);
+    canvas->drawCentreString("3", CX + 66, CY - 9, 4);
 }
 
 static void drawDateWindow(uint8_t day)
@@ -223,10 +356,14 @@ static void drawPowerIndicator()
 
     int pct = 0;
     bool charging = false;
+    float chargeCurrentMa = 0.0f;
+    float dischargeCurrentMa = 0.0f;
 #ifdef LILYGO_WATCH_HAS_AXP202
     if (watch && watch->power) {
         pct = clampPercent(watch->power->getBattPercentage());
         charging = watch->power->isChargeing();
+        chargeCurrentMa = watch->power->getBattChargeCurrent();
+        dischargeCurrentMa = watch->power->getBattDischargeCurrent();
     }
 #endif
 
@@ -244,6 +381,14 @@ static void drawPowerIndicator()
         canvas->drawLine(bx + 5, by + 3, bx + 8, by + 3, TFT_YELLOW);
         canvas->drawLine(bx + 8, by + 3, bx + 6, by + 5, TFT_YELLOW);
     }
+
+    uint32_t remainSeconds = estimateBatterySecondsRemaining(pct, charging, chargeCurrentMa, dischargeCurrentMa);
+    char etaBuf[10];
+    formatHms(remainSeconds, etaBuf, sizeof(etaBuf));
+    canvas->setTextColor(TFT_WHITE, TFT_BLACK);
+    canvas->setTextDatum(TR_DATUM);
+    canvas->setTextFont(1);
+    canvas->drawString(etaBuf, SCREEN_W - 1, by + bh + 4, 1);
 }
 
 static void drawSettingsOverlay()
@@ -396,6 +541,8 @@ void setup()
 
     rtc->check();
     loadSettings();
+    syncRtcToBuildTimeOnce();
+    Serial.println("Serial RTC commands ready. Type HELP");
 
     canvas = new TFT_eSprite(tft);
     canvas->setColorDepth(16);
@@ -410,6 +557,7 @@ void loop()
     static uint8_t lastSecond = 255;
     static uint32_t lastUiFrame = 0;
 
+    handleSerialCommands();
     pollTouchUI();
 
     RTC_Date now = rtc->getDateTime();

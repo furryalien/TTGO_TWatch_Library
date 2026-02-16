@@ -1,0 +1,7 @@
+board_manager:
+  additional_urls:
+    - https://espressif.github.io/arduino-esp32/package_esp32_index.json
+directories:
+  data: D:\arduino-cli-data
+  downloads: D:\arduino-cli-downloads
+  user: C:\Users\dgran\Documents\Arduino

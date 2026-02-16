@@ -13,6 +13,8 @@ CY = H // 2
 
 DEFAULT_TRUE_UTC = True
 LOCAL_TO_UTC_OFFSET_HOURS = 0
+BATTERY_CAPACITY_MAH = 350.0
+DEFAULT_FULL_RUNTIME_SECONDS = 24 * 60 * 60
 
 
 def point_xy(angle_deg: float, radius: int) -> tuple[int, int]:
@@ -59,6 +61,31 @@ def load_font(size: int) -> ImageFont.ImageFont:
         except OSError:
             continue
     return ImageFont.load_default()
+
+
+def estimate_battery_seconds_remaining(pct: int, charging: bool, charge_current_ma: float = 350.0, discharge_current_ma: float = 90.0) -> int:
+    pct = max(0, min(100, pct))
+    ratio = pct / 100.0
+    seconds = ratio * DEFAULT_FULL_RUNTIME_SECONDS
+
+    if charging:
+        if charge_current_ma > 1.0:
+            seconds = ((100.0 - pct) / 100.0) * BATTERY_CAPACITY_MAH / charge_current_ma * 3600.0
+        else:
+            seconds = (1.0 - ratio) * DEFAULT_FULL_RUNTIME_SECONDS
+    else:
+        if discharge_current_ma > 1.0:
+            seconds = ratio * BATTERY_CAPACITY_MAH / discharge_current_ma * 3600.0
+
+    seconds = max(0.0, min(359999.0, seconds))
+    return int(seconds)
+
+
+def format_hms(total_seconds: int) -> str:
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def draw_gmt_arrow(draw: ImageDraw.ImageDraw, angle_deg: float) -> None:
@@ -121,11 +148,11 @@ def draw_face(hour: int, minute: int, second: int, day: int, month: int, year: i
     for i in range(4):
         draw_hand(draw, i * 90.0, 83, -74, 3, c_white)
 
-    font_big = load_font(30)
+    font_big = load_font(15)
     draw_centered(draw, "12", CX, CY - 58, font_big, c_white)
-    draw_centered(draw, "9", CX - 66, CY - 5, font_big, c_white)
-    draw_centered(draw, "6", CX, CY + 54, font_big, c_white)
-    draw_centered(draw, "3", CX + 66, CY - 5, font_big, c_white)
+    draw_centered(draw, "9", CX - 66, CY - 9, font_big, c_white)
+    draw_centered(draw, "6", CX, CY + 58, font_big, c_white)
+    draw_centered(draw, "3", CX + 66, CY - 9, font_big, c_white)
 
     win_cx, win_cy = 169, 161
     draw_centered(draw, f"{day:02d}", win_cx, win_cy, load_font(14), (255, 255, 255))
@@ -147,6 +174,8 @@ def draw_face(hour: int, minute: int, second: int, day: int, month: int, year: i
     if charging:
         bolt = [(bx + 7, by + 1), (bx + 5, by + 3), (bx + 8, by + 3), (bx + 6, by + 5)]
         draw.line(bolt, fill=(240, 220, 40), width=1)
+    remain_text = format_hms(estimate_battery_seconds_remaining(battery, charging))
+    draw.text((W - 2 - (len(remain_text) * 6), by + bh + 4), remain_text, font=load_font(9), fill=(255, 255, 255))
 
     second_angle = second * 6.0
     minute_angle = (minute + second / 60.0) * 6.0
