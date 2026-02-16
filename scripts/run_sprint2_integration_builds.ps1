@@ -39,10 +39,23 @@ try {
     }
     
     if (-not $pioAvailable) {
-        Write-Warning "PlatformIO is not available. Skipping Sprint 2 integration builds."
-        Write-Warning "To enable these tests, install PlatformIO: pip install platformio"
-        Write-Host "Sprint 2 integration builds: SKIPPED (PlatformIO not installed)" -ForegroundColor Yellow
-        exit 0
+        Write-Warning "PlatformIO is not available in selected interpreter. Attempting install..."
+        & $python @pythonArgs -m pip install --upgrade pip
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to upgrade pip in selected interpreter."
+        }
+
+        & $python @pythonArgs -m pip install platformio
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install PlatformIO in selected interpreter."
+        }
+
+        & $python @pythonArgs -m platformio --version 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "PlatformIO installation completed but module still unavailable for selected interpreter."
+        }
+
+        Write-Host "PlatformIO installed successfully for selected interpreter." -ForegroundColor Green
     }
 
     foreach ($example in $examples) {
