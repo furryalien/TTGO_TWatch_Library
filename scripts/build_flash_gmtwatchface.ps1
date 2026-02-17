@@ -20,6 +20,7 @@ $additionalUrl = "https://espressif.github.io/arduino-esp32/package_esp32_index.
 function Invoke-ArduinoCli {
     param([string[]]$CliArgs)
     & $ArduinoCliPath @CliArgs
+    Write-Host "Arduino CLI command: $($CliArgs -join ' ')"
     if ($LASTEXITCODE -ne 0) {
         throw "arduino-cli failed: $($CliArgs -join ' ')"
     }

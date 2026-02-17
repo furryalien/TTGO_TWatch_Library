@@ -52,6 +52,10 @@ static bool backlightDimmed = false;
 static uint32_t lastActivityMs = 0;
 static uint32_t lastRtcSyncMs = 0;
 static uint32_t lastWiFiSyncMs = 0;
+static uint32_t lastBrightnessChangeMs = 0;
+static uint32_t lastIRQCheckMs = 0;
+static const uint32_t BRIGHTNESS_CHANGE_DEBOUNCE_MS = 500;
+static const uint32_t IRQ_CHECK_INTERVAL_MS = 100;  // Only check IRQ 10 times per second
 
 static int clampPercent(int value)
 {
@@ -682,17 +686,40 @@ static void enterLightSleepIfNeeded()
     gpio_wakeup_enable((gpio_num_t)AXP202_INT, GPIO_INTR_LOW_LEVEL);
     
     // Tier 3: Conditional motion wake - only enable if not laying flat
+    // DISABLED to prevent spurious wakes causing brightness oscillation
     // This prevents false wakes from desk vibrations when watch is stationary
-    if (shouldEnableMotionWake()) {
+    if (false && shouldEnableMotionWake()) {
         gpio_wakeup_enable((gpio_num_t)BMA423_INT1, GPIO_INTR_HIGH_LEVEL);
     }
     
     esp_sleep_enable_gpio_wakeup();
     esp_light_sleep_start();
 
+    // === WAKE FROM SLEEP - Check wake reason BEFORE waking display ===
+    
     // Tier 3: Resume balanced frequency on wake
     frequencyScaler.transitionTo(PROFILE_BALANCED);
     
+    // Check if wake was from user button press (not spurious motion)
+    bool buttonPressed = (digitalRead(AXP202_INT) == LOW);
+    
+    if (buttonPressed) {
+        // Button press - this is real user interaction
+        lastActivityMs = millis();
+    }
+    
+    // Check if we should actually wake up or go back to sleep
+    uint32_t inactiveMs = millis() - lastActivityMs;
+    
+    if (!buttonPressed && inactiveMs >= SCREEN_TIMEOUT_MS) {
+        // Spurious wake (motion sensor) with no recent activity
+        // Go straight back to sleep without waking display
+        // Keep displaySleeping=true and let main loop re-enter sleep
+        frequencyScaler.transitionTo(PROFILE_ULTRA_SAVE);
+        return;
+    }
+    
+    // === Actually wake the display ===
     watch->displayWakeup();
     watch->startLvglTick();
     rtc->syncToSystem();
@@ -701,40 +728,25 @@ static void enterLightSleepIfNeeded()
     // Tier 3: Re-enable peripherals for active state
     peripheralManager.optimizeForState(STATE_ACTIVE);
 
-    // Check if wake was from user button press (not spurious motion)
-    // If button was pressed, treat as user interaction and brighten display
-    if (digitalRead(AXP202_INT) == LOW) {
-        // Button is pressed - brighten display and reset activity timer
-        lastActivityMs = millis();
-        backlightDimmed = false;
-        watch->setBrightness(calculateContextualBrightness(false));
-        // Clear the power management IRQ
-        watch->power->readIRQ();
-        watch->power->clearIRQ();
-    }
-    
-    // Check if we should immediately return to dim/sleep state
-    uint32_t inactiveMs = millis() - lastActivityMs;
-    
-    if (inactiveMs >= SCREEN_TIMEOUT_MS) {
-        // Too much time has passed - go back to sleep immediately
-        // This was a spurious wake event, not user interaction
-        // Keep displaySleeping=true and re-enter sleep loop via main loop
-        return;
-    }
-    
-    // If we're here, wake was recent enough to show display
     displaySleeping = false;
     watch->openBL();
     
-    if (inactiveMs >= DIM_TIMEOUT_MS) {
-        // Show dimmed display
-        watch->setBrightness(calculateContextualBrightness(true));
-        backlightDimmed = true;
-    } else {
-        // Show full brightness
+    // Set brightness based on button press
+    if (buttonPressed) {
+        // Button pressed - brighten display
+        Serial.println("[BRIGHTNESS] Wake from sleep - button pressed - brightening");
         watch->setBrightness(calculateContextualBrightness(false));
         backlightDimmed = false;
+        lastBrightnessChangeMs = millis();
+        // Clear the power management IRQ
+        watch->power->readIRQ();
+        watch->power->clearIRQ();
+    } else {
+        // Wake without button (shouldn't happen now, but handle it)
+        Serial.println("[BRIGHTNESS] Wake from sleep - no button - dimmed");
+        watch->setBrightness(calculateContextualBrightness(true));
+        backlightDimmed = true;
+        lastBrightnessChangeMs = millis();
     }
     
     // Tier 3: Force sleep manager back to active
@@ -749,50 +761,26 @@ static void applyBacklightPolicy()
         return;
     }
     
-    // Check for physical button press to brighten display
-    #ifdef LILYGO_WATCH_HAS_AXP202
-    if (watch && watch->power) {
-        watch->power->readIRQ();
-        if (watch->power->isPEKShortPressIRQ()) {
-            // Physical button pressed - brighten and reset timer
-            lastActivityMs = millis();
-            if (backlightDimmed) {
-                watch->setBrightness(calculateContextualBrightness(false));
-                backlightDimmed = false;
-            }
-            watch->power->clearIRQ();
-            return;
-        }
-        watch->power->clearIRQ();
-    }
-    #endif
-
+    // Simple brightness control: only dim after timeout, never auto-brighten
+    // Button press handled separately via touch or can be enabled via IRQ
+    
     uint32_t inactiveMs = millis() - lastActivityMs;
     
-    // Tier 3: Update sleep state manager
-    sleepManager.update(inactiveMs);
-    SleepState currentState = sleepManager.getCurrentState();
-    
-    // Tier 3: Optimize peripherals based on state
-    peripheralManager.optimizeForState(currentState);
-    
-    if (inactiveMs < DIM_TIMEOUT_MS) {
-        if (backlightDimmed) {
-            watch->setBrightness(calculateContextualBrightness(false));
-            backlightDimmed = false;
-        }
-        return;
+    // Dim after DIM_TIMEOUT_MS
+    if (inactiveMs >= DIM_TIMEOUT_MS && !backlightDimmed) {
+        Serial.println("[BRIGHTNESS] Auto-dimming after 15s inactivity");
+        watch->setBrightness(calculateContextualBrightness(true));
+        backlightDimmed = true;
+        lastBrightnessChangeMs = millis();
     }
-
-    if (inactiveMs < SCREEN_TIMEOUT_MS) {
-        if (!backlightDimmed) {
-            watch->setBrightness(calculateContextualBrightness(true));
-            backlightDimmed = true;
-        }
-        return;
+    
+    // Sleep after SCREEN_TIMEOUT_MS (currently disabled to prevent wake oscillation)
+    // Uncomment when motion wake issues are resolved
+    /*
+    if (inactiveMs >= SCREEN_TIMEOUT_MS) {
+        enterLightSleepIfNeeded();
     }
-
-    enterLightSleepIfNeeded();
+    */
 }
 
 static void drawStaticDial()
@@ -1068,13 +1056,19 @@ static void pollTouchUI()
     if (touched && !touchDown) {
         touchDown = true;
         touchDownStart = millis();
-        // Note: Do NOT update lastActivityMs from touch - only physical button controls brightness
+        
+        // Touch can now brighten display (simpler than IRQ)
+        if (backlightDimmed) {
+            watch->setBrightness(calculateContextualBrightness(false));
+            backlightDimmed = false;
+            lastBrightnessChangeMs = millis();
+        }
+        lastActivityMs = millis();
     }
 
     if (touched) {
         lastTouchX = x;
         lastTouchY = y;
-        // Note: Do NOT update lastActivityMs from touch - only physical button controls brightness
     }
 
     if (touchDown && touched && !settingsOpen) {
@@ -1109,14 +1103,19 @@ void setup()
     // Keep LVGL clock active because this is an LVGL-configured example folder.
     watch->lvgl_begin();
 
-    // Tier 1: lower default brightness with context awareness.
-    watch->setBrightness(calculateContextualBrightness(false));
+    // Tier 1: Start with dim brightness (only button press will brighten)
+    watch->setBrightness(calculateContextualBrightness(true));
 
 #ifdef LILYGO_WATCH_HAS_AXP202
     watch->power->adc1Enable(AXP202_BATT_VOL_ADC1 | AXP202_BATT_CUR_ADC1 | AXP202_VBUS_VOL_ADC1 | AXP202_VBUS_CUR_ADC1, AXP202_ON);
-    // Enable power button IRQ for brightness control
+    
+    // Clear any pending IRQs before enabling
+    watch->power->clearIRQ();
+    
+    // Only enable power button short press IRQ for brightness control
     watch->power->enableIRQ(AXP202_PEK_SHORTPRESS_IRQ, AXP202_ON);
     watch->power->clearIRQ();
+    
     // Tier 1: disable audio rail when not used
     watch->power->setPowerOutPut(AXP202_LDO3, AXP202_OFF);
 #endif
@@ -1124,7 +1123,7 @@ void setup()
     // Tier 2: sensor policy defaults while screen is active
     watch->bma->enableWakeupInterrupt(false);
     watch->bma->enableAccel();
-    watch->bma->enableStepCountInterrupt(true);
+    watch->bma->enableStepCountInterrupt(false);  // Temporarily disabled to diagnose brightness issue
 
     rtc = watch->rtc;
     tft = watch->tft;
@@ -1148,13 +1147,16 @@ void setup()
 
     drawFace(rtc->getDateTime());
 
-    // Start dim by default - only button press will brighten
-    lastActivityMs = 0;
-    backlightDimmed = true;
-    watch->setBrightness(calculateContextualBrightness(true));
+    // Start with full brightness, will auto-dim after 15 seconds
+    lastActivityMs = millis();
+    backlightDimmed = false;
+    watch->setBrightness(calculateContextualBrightness(false));
+    lastBrightnessChangeMs = millis();
     
     lastRtcSyncMs = millis();
     lastWiFiSyncMs = 0;
+    
+    Serial.println("[BRIGHTNESS] Setup complete - display active, will dim in 15s");
 }
 
 void loop()

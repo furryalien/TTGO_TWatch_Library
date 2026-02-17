@@ -1,0 +1,1 @@
+& "C:\Program Files\Arduino CLI\arduino-cli.exe" monitor -b esp32:esp32:twatch -p COM4 --config baudrate=115200
