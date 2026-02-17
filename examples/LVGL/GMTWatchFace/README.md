@@ -4,9 +4,10 @@ Analog GMT watch face for TTGO T-Watch with:
 
 - Hour, minute, second hands
 - Red GMT hand with arrow tip
-- Numeric date window
+- Numeric date window at 430
+- Day of Week at 730
 - 24-hour chapter ring
-- Large 12 / 9 / 6 markers
+- Large 12 / 9 / 6 / 3 markers
 
 ## Quick config
 

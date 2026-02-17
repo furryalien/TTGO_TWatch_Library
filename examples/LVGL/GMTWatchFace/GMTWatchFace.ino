@@ -24,6 +24,7 @@ static const int8_t LOCAL_TO_UTC_OFFSET_HOURS = 0;
 
 static bool gmtModeTrueUtc = DEFAULT_TRUE_UTC;
 static int8_t gmtOffsetHours = 0;
+static uint32_t lastFullChargeTimestamp = 0;
 
 static bool settingsOpen = false;
 static bool touchDown = false;
@@ -207,11 +208,17 @@ static void saveSettings()
     prefs.putChar("gmtOff", gmtOffsetHours);
 }
 
+static void saveLastFullChargeTimestamp()
+{
+    prefs.putUInt("lastCharge", lastFullChargeTimestamp);
+}
+
 static void loadSettings()
 {
     prefs.begin("gmtface", false);
     gmtModeTrueUtc = prefs.getBool("trueUtc", DEFAULT_TRUE_UTC);
     gmtOffsetHours = clampOffset((int8_t)prefs.getChar("gmtOff", 0));
+    lastFullChargeTimestamp = prefs.getUInt("lastCharge", 0);
 }
 
 static void syncRtcToBuildTimeOnce()
@@ -855,6 +862,8 @@ static void drawPowerIndicator()
 {
     static uint32_t lastBatteryUpdateMs = 0;
     static uint32_t cachedRemainingMinutes = 0;
+    static bool wasCharging = false;
+    static bool initialized = false;
     const uint32_t BATTERY_UPDATE_INTERVAL_MS = 5UL * 60UL * 1000UL;
 
     const int16_t bx = 205;
@@ -872,6 +881,24 @@ static void drawPowerIndicator()
         charging = watch->power->isChargeing();
         chargeCurrentMa = watch->power->getBattChargeCurrent();
         dischargeCurrentMa = watch->power->getBattDischargeCurrent();
+        
+        // Initialize timestamp on first run if never set
+        if (!initialized) {
+            if (lastFullChargeTimestamp == 0) {
+                lastFullChargeTimestamp = millis() / 1000UL;
+                saveLastFullChargeTimestamp();
+            }
+            initialized = true;
+        }
+        
+        // Update timestamp when at full charge
+        if (charging && pct >= 99) {
+            lastFullChargeTimestamp = millis() / 1000UL;
+            if (millis() - lastBatteryUpdateMs >= BATTERY_UPDATE_INTERVAL_MS) {
+                saveLastFullChargeTimestamp();
+            }
+        }
+        wasCharging = charging;
     }
 #endif
 
@@ -902,6 +929,18 @@ static void drawPowerIndicator()
     canvas->setTextDatum(TR_DATUM);
     canvas->setTextFont(1);
     canvas->drawString(minBuf, SCREEN_W - 1, by + bh + 4, 1);
+    
+    // Draw elapsed time since last full charge below remaining time
+    if (lastFullChargeTimestamp > 0) {
+        uint32_t currentSeconds = millis() / 1000UL;
+        uint32_t elapsedSeconds = currentSeconds - lastFullChargeTimestamp;
+        uint32_t elapsedMinutes = elapsedSeconds / 60UL;
+        
+        char elapsedBuf[8];
+        snprintf(elapsedBuf, sizeof(elapsedBuf), "+%lum", (unsigned long)elapsedMinutes);
+        canvas->setTextColor(TFT_CYAN, TFT_BLACK);
+        canvas->drawString(elapsedBuf, SCREEN_W - 1, by + bh + 4 + 10, 1);
+    }
 }
 
 static void drawSettingsOverlay()
