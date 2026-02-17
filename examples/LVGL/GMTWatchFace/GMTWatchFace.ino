@@ -702,10 +702,12 @@ static void enterLightSleepIfNeeded()
     peripheralManager.optimizeForState(STATE_ACTIVE);
 
     // Check if wake was from user button press (not spurious motion)
-    // If button was pressed, treat as user interaction
+    // If button was pressed, treat as user interaction and brighten display
     if (digitalRead(AXP202_INT) == LOW) {
-        // Button is pressed - this is intentional wake
+        // Button is pressed - brighten display and reset activity timer
         lastActivityMs = millis();
+        backlightDimmed = false;
+        watch->setBrightness(calculateContextualBrightness(false));
         // Clear the power management IRQ
         watch->power->readIRQ();
         watch->power->clearIRQ();
@@ -746,6 +748,24 @@ static void applyBacklightPolicy()
     if (displaySleeping) {
         return;
     }
+    
+    // Check for physical button press to brighten display
+    #ifdef LILYGO_WATCH_HAS_AXP202
+    if (watch && watch->power) {
+        watch->power->readIRQ();
+        if (watch->power->isPEKShortPressIRQ()) {
+            // Physical button pressed - brighten and reset timer
+            lastActivityMs = millis();
+            if (backlightDimmed) {
+                watch->setBrightness(calculateContextualBrightness(false));
+                backlightDimmed = false;
+            }
+            watch->power->clearIRQ();
+            return;
+        }
+        watch->power->clearIRQ();
+    }
+    #endif
 
     uint32_t inactiveMs = millis() - lastActivityMs;
     
@@ -1048,13 +1068,13 @@ static void pollTouchUI()
     if (touched && !touchDown) {
         touchDown = true;
         touchDownStart = millis();
-        lastActivityMs = millis();
+        // Note: Do NOT update lastActivityMs from touch - only physical button controls brightness
     }
 
     if (touched) {
         lastTouchX = x;
         lastTouchY = y;
-        lastActivityMs = millis();
+        // Note: Do NOT update lastActivityMs from touch - only physical button controls brightness
     }
 
     if (touchDown && touched && !settingsOpen) {
@@ -1094,6 +1114,9 @@ void setup()
 
 #ifdef LILYGO_WATCH_HAS_AXP202
     watch->power->adc1Enable(AXP202_BATT_VOL_ADC1 | AXP202_BATT_CUR_ADC1 | AXP202_VBUS_VOL_ADC1 | AXP202_VBUS_CUR_ADC1, AXP202_ON);
+    // Enable power button IRQ for brightness control
+    watch->power->enableIRQ(AXP202_PEK_SHORTPRESS_IRQ, AXP202_ON);
+    watch->power->clearIRQ();
     // Tier 1: disable audio rail when not used
     watch->power->setPowerOutPut(AXP202_LDO3, AXP202_OFF);
 #endif
@@ -1125,7 +1148,11 @@ void setup()
 
     drawFace(rtc->getDateTime());
 
-    lastActivityMs = millis();
+    // Start dim by default - only button press will brighten
+    lastActivityMs = 0;
+    backlightDimmed = true;
+    watch->setBrightness(calculateContextualBrightness(true));
+    
     lastRtcSyncMs = millis();
     lastWiFiSyncMs = 0;
 }
