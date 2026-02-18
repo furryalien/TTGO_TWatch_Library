@@ -1,26 +1,29 @@
 /*
- * GMTWatchFace - Power Optimized Watch Firmware
+ * GMTWatchFace - Firmware-Integrated Power Management
  * 
- * POWER OPTIMIZATIONS IMPLEMENTED:
+ * This example uses the TTGO Library's built-in power management framework.
+ * Power optimizations are now handled automatically by the firmware:
  * 
- * 1. CPU Frequency: 20MHz (proven by BatmanDial), scales to 160MHz for WiFi
- * 2. ADC Management: Only battery monitoring enabled, unused ADCs disabled (~100-200µA savings)
- * 3. ADC Sampling: Reduced from 200Hz to 25Hz (~50-100µA savings)
- * 4. Wireless: WiFi and Bluetooth completely disabled except during charging sync
- * 5. Temperature Sensor: Disabled (~10µA savings)
- * 6. Charging: Optimized to 300mA for reduced heat and better efficiency
- * 7. Audio Rail: LDO3 disabled when not in use
- * 8. LVGL: Refresh rate set in lv_conf.h (30ms/33Hz) for power/responsiveness balance
- * 9. Sleep Domains: Flash power-down during light sleep
- * 10. Touch Controller: Auto-managed via displaySleep() (monitor mode ~24µA)
- * 11. Sensors: Accelerometer disabled during sleep (~165µA savings)
- * 12. Dynamic Frequency Scaling: Adapts CPU speed to workload
- * 13. Context-Aware Brightness: Time and battery-based brightness adjustment
+ * AUTOMATIC OPTIMIZATIONS (handled by firmware in begin()):
+ * 1. CPU Frequency: Default 80MHz balanced mode with automatic scaling
+ * 2. ADC Management: Only battery monitoring enabled (~100-200µA savings)
+ * 3. ADC Sampling: 25Hz sampling rate (~50-100µA savings)
+ * 4. Sleep State Management: Automatic sleep transitions and wake handling
+ * 5. Peripheral Power: Automatic sensor power management in sleep states
+ * 6. Touch Controller: Auto-managed via displaySleep() (monitor mode ~24µA)
+ * 7. Frequency Scaling: Automatic CPU frequency based on workload
+ * 
+ * APPLICATION-SPECIFIC:
+ * - Context-Aware Brightness: Time and battery-based brightness adjustment
+ * - WiFi Sync: Only when charging (application policy)
+ * - GMT Hand: User-configurable timezone offset
  * 
  * EXPECTED POWER CONSUMPTION:
  * - Active (screen on):  ~35-45mA (vs baseline ~65mA) - 30% reduction
  * - Light sleep:         ~2-3mA (vs baseline ~4mA) - 40% reduction
  * - Battery life improvement: 40-60% in typical usage
+ * 
+ * CODE REDUCTION: ~300 lines of power management code eliminated!
  */
 
 #include "config.h"
@@ -265,264 +268,12 @@ static void syncRtcToBuildTimeOnce()
 }
 
 // ============================================================================
-// TIER 3: ADVANCED POWER MANAGEMENT CLASSES
-// ============================================================================
-
-enum PowerProfile {
-    PROFILE_PERFORMANCE,   // 160 MHz - network operations
-    PROFILE_BALANCED,      // 20 MHz - normal UI (proven by BatmanDial)
-    PROFILE_POWER_SAVE,    // 20 MHz - static watch face
-    PROFILE_ULTRA_SAVE     // 20 MHz - sleep/minimal updates
-};
-
-class DynamicFrequencyScaler {
-private:
-    PowerProfile currentProfile;
-    uint32_t lastTransition;
-    bool wifiActive;
-    bool animationActive;
-    
-public:
-    DynamicFrequencyScaler() : currentProfile(PROFILE_BALANCED), lastTransition(0), 
-                               wifiActive(false), animationActive(false) {}
-    
-    void setWiFiActive(bool active) {
-        wifiActive = active;
-        update();
-    }
-    
-    void setAnimationActive(bool active) {
-        animationActive = active;
-        update();
-    }
-    
-    void update() {
-        PowerProfile target = calculateOptimalProfile();
-        if (target != currentProfile) {
-            transitionTo(target);
-        }
-    }
-    
-    PowerProfile calculateOptimalProfile() {
-        if (wifiActive || animationActive) {
-            return PROFILE_PERFORMANCE;
-        } else if (displaySleeping) {
-            return PROFILE_ULTRA_SAVE;
-        } else if (settingsOpen || (millis() - lastActivityMs) < 3000) {
-            return PROFILE_BALANCED;
-        } else {
-            return PROFILE_POWER_SAVE;
-        }
-    }
-    
-    void transitionTo(PowerProfile profile) {
-        uint8_t freq = 20;
-        switch(profile) {
-            case PROFILE_PERFORMANCE: freq = 160; break;
-            case PROFILE_BALANCED:    freq = 20;  break;
-            case PROFILE_POWER_SAVE:  freq = 20;  break;
-            case PROFILE_ULTRA_SAVE:  freq = 20;  break;
-        }
-        setCpuFrequencyMhz(freq);
-        currentProfile = profile;
-        lastTransition = millis();
-    }
-    
-    PowerProfile getCurrentProfile() const {
-        return currentProfile;
-    }
-};
-
-enum SleepState {
-    STATE_ACTIVE,        // Full power, screen on
-    STATE_IDLE,          // Screen on, no interaction
-    STATE_DIM,           // Screen dimmed
-    STATE_LIGHT_SLEEP,   // Screen off, quick wake
-    STATE_DEEP_STANDBY   // Maximum power save (not implemented for active use)
-};
-
-class SleepStateManager {
-private:
-    SleepState currentState;
-    uint32_t stateEnterTime;
-    
-    static const uint32_t IDLE_TRANSITION_MS = 3000;
-    static const uint32_t LIGHT_SLEEP_TIMEOUT_MS = 300000;  // 5 minutes
-    
-public:
-    SleepStateManager() : currentState(STATE_ACTIVE), stateEnterTime(0) {}
-    
-    void update(uint32_t inactiveMs) {
-        SleepState targetState = calculateTargetState(inactiveMs);
-        if (targetState != currentState) {
-            transitionTo(targetState);
-        }
-    }
-    
-    SleepState calculateTargetState(uint32_t inactiveMs) {
-        if (inactiveMs < IDLE_TRANSITION_MS) {
-            return STATE_ACTIVE;
-        } else if (inactiveMs < DIM_TIMEOUT_MS) {
-            return STATE_IDLE;
-        } else if (inactiveMs < SCREEN_TIMEOUT_MS) {
-            return STATE_DIM;
-        } else {
-            return STATE_LIGHT_SLEEP;
-        }
-    }
-    
-    void transitionTo(SleepState newState) {
-        currentState = newState;
-        stateEnterTime = millis();
-    }
-    
-    SleepState getCurrentState() const {
-        return currentState;
-    }
-    
-    void forceActive() {
-        transitionTo(STATE_ACTIVE);
-    }
-};
-
-class AlwaysOnDisplayManager {
-private:
-    bool aodEnabled;
-    bool aodActive;
-    uint32_t lastAodUpdate;
-    static const uint32_t AOD_UPDATE_INTERVAL_MS = 60000;  // Update every minute
-    static const uint8_t AOD_BRIGHTNESS = 15;  // 5% brightness
-    
-public:
-    AlwaysOnDisplayManager() : aodEnabled(false), aodActive(false), lastAodUpdate(0) {}
-    
-    void setEnabled(bool enabled) {
-        aodEnabled = enabled;
-    }
-    
-    bool isEnabled() const {
-        return aodEnabled;
-    }
-    
-    bool isActive() const {
-        return aodActive;
-    }
-    
-    void activate() {
-        if (!aodEnabled) return;
-        
-        aodActive = true;
-        watch->setBrightness(AOD_BRIGHTNESS);
-        setCpuFrequencyMhz(20);
-        lastAodUpdate = millis();
-    }
-    
-    void deactivate() {
-        aodActive = false;
-        watch->setBrightness(calculateContextualBrightness(false));
-        setCpuFrequencyMhz(80);
-    }
-    
-    bool needsUpdate() {
-        if (!aodActive) return false;
-        return (millis() - lastAodUpdate) >= AOD_UPDATE_INTERVAL_MS;
-    }
-    
-    void markUpdated() {
-        lastAodUpdate = millis();
-    }
-};
-
-class PeripheralPowerManager {
-private:
-    bool accelEnabled;
-    bool stepCountEnabled;
-    bool audioEnabled;
-    uint32_t lastOptimization;
-    
-    static const uint32_t OPTIMIZATION_INTERVAL_MS = 10000;
-    
-public:
-    PeripheralPowerManager() : accelEnabled(true), stepCountEnabled(true), 
-                               audioEnabled(false), lastOptimization(0) {}
-    
-    void optimizeForState(SleepState state) {
-        if (millis() - lastOptimization < OPTIMIZATION_INTERVAL_MS) {
-            return;
-        }
-        
-        switch(state) {
-            case STATE_ACTIVE:
-            case STATE_IDLE:
-            case STATE_DIM:
-                enableAccelIfNeeded(true);
-                enableStepCountIfNeeded(true);
-                break;
-                
-            case STATE_LIGHT_SLEEP:
-                enableAccelIfNeeded(false);
-                enableStepCountIfNeeded(false);
-                break;
-                
-            case STATE_DEEP_STANDBY:
-                disableAllPeripherals();
-                break;
-        }
-        
-        lastOptimization = millis();
-    }
-    
-    void enableAccelIfNeeded(bool enable) {
-        if (accelEnabled != enable) {
-            if (enable) {
-                watch->bma->enableAccel();
-            } else {
-                watch->bma->disableAccel();
-            }
-            accelEnabled = enable;
-        }
-    }
-    
-    void enableStepCountIfNeeded(bool enable) {
-        if (stepCountEnabled != enable) {
-            watch->bma->enableStepCountInterrupt(enable);
-            stepCountEnabled = enable;
-        }
-    }
-    
-    void disableAllPeripherals() {
-        watch->bma->disableAccel();
-        watch->bma->enableStepCountInterrupt(false);
-        watch->bma->enableWakeupInterrupt(false);
-        
-#ifdef LILYGO_WATCH_HAS_AXP202
-        if (watch && watch->power) {
-            watch->power->setPowerOutPut(AXP202_LDO3, AXP202_OFF);
-        }
-#endif
-        
-        accelEnabled = false;
-        stepCountEnabled = false;
-        audioEnabled = false;
-    }
-    
-    float estimatePowerSavings() {
-        float savings = 0.0f;
-        if (!accelEnabled) savings += 0.165f;  // mA
-        if (!stepCountEnabled) savings += 0.05f;
-        if (!audioEnabled) savings += 0.3f;
-        return savings;
-    }
-};
-
-// Global Tier 3 managers
-static DynamicFrequencyScaler frequencyScaler;
-static SleepStateManager sleepManager;
-static AlwaysOnDisplayManager aodManager;
-static PeripheralPowerManager peripheralManager;
-
-// ============================================================================
-// END TIER 3 CLASSES
+// POWER MANAGEMENT: Now handled by firmware!
+// The following classes have been REMOVED and replaced with firmware functions:
+// - DynamicFrequencyScaler -> watch->getFrequencyScaler()
+// - SleepStateManager -> watch->getPowerManager()->configureSleepTimeouts()
+// - PeripheralPowerManager -> Automatic in displaySleep()/displayWakeup()
+// - AlwaysOnDisplayManager -> Future firmware feature
 // ============================================================================
 
 static bool parseAndSetRtcFromSerial(const char *cmd)
@@ -649,9 +400,7 @@ static void smartWiFiSyncChargingOnly()
 
     bool wasConnected = WiFi.isConnected();
     if (!wasConnected) {
-        // Tier 3: Notify frequency scaler WiFi is activating
-        frequencyScaler.setWiFiActive(true);
-        
+        // Firmware automatically scales CPU to 160MHz for WiFi
         WiFi.mode(WIFI_STA);
         WiFi.begin();
         uint32_t start = millis();
@@ -678,9 +427,7 @@ static void smartWiFiSyncChargingOnly()
     if (!wasConnected) {
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
-        
-        // Tier 3: Notify frequency scaler WiFi is done
-        frequencyScaler.setWiFiActive(false);
+        // Firmware automatically returns to balanced frequency
     }
 
     lastWiFiSyncMs = millis();
@@ -693,25 +440,17 @@ static void enterLightSleepIfNeeded()
     }
 
     watch->closeBL();
-    watch->displaySleep();
+    watch->displaySleep();  // Firmware handles touch power-down and sensor optimization
     watch->stopLvglTick();
     backlightDimmed = false;
 
-    // Tier 3: Peripheral manager handles sensor optimization
-    peripheralManager.optimizeForState(STATE_LIGHT_SLEEP);
-
     WiFi.mode(WIFI_OFF);
-    
-    // Tier 3: Dynamic frequency scaling for ultra-save mode
-    frequencyScaler.transitionTo(PROFILE_ULTRA_SAVE);
-
     displaySleeping = true;
     
     // Always enable power button wake
     gpio_wakeup_enable((gpio_num_t)AXP202_INT, GPIO_INTR_LOW_LEVEL);
     
-    // Tier 3: Conditional motion wake - only enable if not laying flat
-    // DISABLED to prevent spurious wakes causing brightness oscillation
+    // Motion wake disabled to prevent spurious wakes causing brightness oscillation
     // This prevents false wakes from desk vibrations when watch is stationary
     if (false && shouldEnableMotionWake()) {
         gpio_wakeup_enable((gpio_num_t)BMA423_INT1, GPIO_INTR_HIGH_LEVEL);
@@ -721,9 +460,7 @@ static void enterLightSleepIfNeeded()
     esp_light_sleep_start();
 
     // === WAKE FROM SLEEP - Check wake reason BEFORE waking display ===
-    
-    // Tier 3: Resume balanced frequency on wake
-    frequencyScaler.transitionTo(PROFILE_BALANCED);
+    // Firmware automatically resumes balanced CPU frequency
     
     // Check if wake was from user button press (not spurious motion)
     bool buttonPressed = (digitalRead(AXP202_INT) == LOW);
@@ -740,18 +477,14 @@ static void enterLightSleepIfNeeded()
         // Spurious wake (motion sensor) with no recent activity
         // Go straight back to sleep without waking display
         // Keep displaySleeping=true and let main loop re-enter sleep
-        frequencyScaler.transitionTo(PROFILE_ULTRA_SAVE);
         return;
     }
     
     // === Actually wake the display ===
-    watch->displayWakeup();
+    watch->displayWakeup();  // Firmware handles touch power-up and sensor re-enable
     watch->startLvglTick();
     rtc->syncToSystem();
     lastRtcSyncMs = millis();
-
-    // Tier 3: Re-enable peripherals for active state
-    peripheralManager.optimizeForState(STATE_ACTIVE);
 
     displaySleeping = false;
     watch->openBL();
@@ -773,9 +506,6 @@ static void enterLightSleepIfNeeded()
         backlightDimmed = true;
         lastBrightnessChangeMs = millis();
     }
-    
-    // Tier 3: Force sleep manager back to active
-    sleepManager.forceActive();
     
     drawFace(rtc->getDateTime());
 }
@@ -1116,15 +846,19 @@ void setup()
     Serial.begin(115200);
 
     watch = TTGOClass::getWatch();
-    watch->begin();
+    watch->begin();  // Firmware now handles: CPU 80MHz, ADC optimization, power config
     watch->openBL();
 
-    // Tier 1: minimum CPU frequency for time accuracy (20 MHz proven by BatmanDial)
-    setCpuFrequencyMhz(20);
-
-    // Tier 1: disable WiFi and Bluetooth by default (saves 20-40mA)
+    // Firmware automatically:
+    // - Sets CPU to 80MHz balanced mode
+    // - Enables only battery ADCs at 25Hz sampling
+    // - Disables unused ADCs and temperature sensor
+    // - Configures sleep state management
+    // - Sets up automatic frequency scaling
+    
+    // Application-specific: Disable WiFi and Bluetooth by default (saves 20-40mA)
     WiFi.mode(WIFI_OFF);
-    btStop();  // Explicitly stop Bluetooth stack
+    btStop();
     
     // Configure ESP32 sleep power domains for better light sleep efficiency
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
@@ -1136,45 +870,11 @@ void setup()
     // Note: LVGL refresh rate is set in lv_conf.h (LV_DISP_DEF_REFR_PERIOD = 30ms / 33Hz)
     // This is already optimized for power vs responsiveness balance
 
-    // Tier 1: Start with dim brightness (only button press will brighten)
+    // Optional: Configure sleep timeouts (defaults are already good)
+    // watch->getPowerManager()->configureSleepTimeouts(15000, 30000);
+
+    // Start with contextual brightness
     watch->setBrightness(calculateContextualBrightness(true));
-
-#ifdef LILYGO_WATCH_HAS_AXP202
-    // Enable only essential ADCs (battery monitoring)
-    watch->power->adc1Enable(AXP202_BATT_VOL_ADC1 | AXP202_BATT_CUR_ADC1, AXP202_ON);
-    
-    // Disable unused ADCs to save power (~100-200µA total)
-    watch->power->adc1Enable(AXP202_VBUS_VOL_ADC1, AXP202_OFF);
-    watch->power->adc1Enable(AXP202_VBUS_CUR_ADC1, AXP202_OFF);
-    watch->power->adc1Enable(AXP202_ACIN_VOL_ADC1, AXP202_OFF);
-    watch->power->adc1Enable(AXP202_ACIN_CUR_ADC1, AXP202_OFF);
-    watch->power->adc1Enable(AXP202_TS_PIN_ADC1, AXP202_OFF);
-    
-    // Reduce ADC sampling rate from default 200Hz to 25Hz (~50-100µA savings)
-    watch->power->setAdcSamplingRate(AXP_ADC_SAMPLING_RATE_25HZ);
-    
-    // Disable temperature sensor pin (~10µA savings)
-    watch->power->setTSmode(AXP_TS_PIN_MODE_DISABLE);
-    
-    // Optimize charging settings (reduces heat, improves efficiency)
-    watch->power->setChargingTargetVoltage(AXP202_TARGET_VOL_4_2V);
-    watch->power->setChargeControlCur(300);  // 300mA charging current
-    
-    // Clear any pending IRQs before enabling
-    watch->power->clearIRQ();
-    
-    // Only enable power button short press IRQ for brightness control
-    watch->power->enableIRQ(AXP202_PEK_SHORTPRESS_IRQ, AXP202_ON);
-    watch->power->clearIRQ();
-    
-    // Tier 1: disable audio rail when not used
-    watch->power->setPowerOutPut(AXP202_LDO3, AXP202_OFF);
-#endif
-
-    // Tier 2: sensor policy defaults while screen is active
-    watch->bma->enableWakeupInterrupt(false);
-    watch->bma->enableAccel();
-    watch->bma->enableStepCountInterrupt(false);  // Temporarily disabled to diagnose brightness issue
 
     rtc = watch->rtc;
     tft = watch->tft;
@@ -1189,13 +889,6 @@ void setup()
     canvas->createSprite(SCREEN_W, SCREEN_H);
     canvas->fillSprite(TFT_BLACK);
 
-    // Tier 3: Initialize power managers
-    frequencyScaler.transitionTo(PROFILE_BALANCED);
-    sleepManager.forceActive();
-    peripheralManager.optimizeForState(STATE_ACTIVE);
-    aodManager.setEnabled(false);  // AOD disabled by default
-    Serial.println("Tier 3 power managers initialized");
-
     drawFace(rtc->getDateTime());
 
     // Start with full brightness, will auto-dim after 15 seconds
@@ -1207,7 +900,7 @@ void setup()
     lastRtcSyncMs = millis();
     lastWiFiSyncMs = 0;
     
-    Serial.println("[BRIGHTNESS] Setup complete - display active, will dim in 15s");
+    Serial.println("[SETUP] Complete - firmware power management active");
 }
 
 void loop()
@@ -1218,13 +911,12 @@ void loop()
     handleSerialCommands();
     pollTouchUI();
 
-    // Tier 2 policies
+    // Application-specific policies
     applyBacklightPolicy();
     periodicRtcSync();
     smartWiFiSyncChargingOnly();
     
-    // Tier 3: Update dynamic frequency scaling
-    frequencyScaler.update();
+    // Firmware handles: frequency scaling, sleep management, peripheral power
 
     RTC_Date now = rtc->getDateTime();
 
